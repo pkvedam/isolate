@@ -7,7 +7,6 @@
 
 #include "isolate.h"
 
-#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -15,11 +14,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-struct cg_controller_desc {
-  const char *name;
-  int optional;
-};
 
 typedef enum {
   CG_MEMORY = 0,
@@ -29,44 +23,19 @@ typedef enum {
   CG_PARENT = 256,
 } cg_controller;
 
-static const struct cg_controller_desc cg_controllers[CG_NUM_CONTROLLERS+1] = {
-  [CG_MEMORY]  = { "memory",  0 },
-  [CG_CPUACCT] = { "cpuacct", 0 },
-  [CG_CPUSET]  = { "cpuset",  1 },
-  [CG_NUM_CONTROLLERS] = { NULL, 0 },
-};
-
-#define FOREACH_CG_CONTROLLER(_controller) \
-  for (cg_controller (_controller) = 0; \
-       (_controller) < CG_NUM_CONTROLLERS; (_controller)++)
-
-static const char *
-cg_controller_name(cg_controller c)
-{
-  assert(c < CG_NUM_CONTROLLERS);
-  return cg_controllers[c].name;
-}
-
-static int
-cg_controller_optional(cg_controller c)
-{
-  assert(c < CG_NUM_CONTROLLERS);
-  return cg_controllers[c].optional;
-}
-
 static char cg_name[256];
 static char cg_parent_name[256];
 
 #define CG_BUFSIZE 1024
 
 static void
-cg_makepath(char *buf, size_t len, cg_controller c, const char *attr)
+cg_makepath(char *buf, size_t len, cg_controller c UNUSED, const char *attr)
 {
-  snprintf(buf, len, "%s/%s/%s/%s",
-    cf_cg_root,
-    cg_controller_name(c & ~CG_PARENT),
-    (c & CG_PARENT) ? cg_parent_name : cg_name,
-    attr);
+  const char *group = (c & CG_PARENT) ? cg_parent_name : cg_name;
+  if (attr && attr[0])
+    snprintf(buf, len, "%s/%s/%s", cf_cg_root, group, attr);
+  else
+    snprintf(buf, len, "%s/%s", cf_cg_root, group);
 }
 
 static int
@@ -195,29 +164,29 @@ cg_prepare(void)
   struct stat st;
   char buf[CG_BUFSIZE];
   char path[256];
+  struct cf_per_box *cf = cf_current_box();
 
-  FOREACH_CG_CONTROLLER(controller)
+  cg_write(CG_PARENT | CG_MEMORY, "cgroup.subtree_control", "+memory\n");
+  cg_write(CG_PARENT | CG_CPUACCT, "cgroup.subtree_control", "+cpu\n");
+  cg_write(CG_PARENT | CG_CPUSET, "?cgroup.subtree_control", "+cpuset\n");
+
+  cg_makepath(path, sizeof(path), CG_MEMORY, "");
+  if (stat(path, &st) >= 0 || errno != ENOENT)
     {
-      cg_makepath(path, sizeof(path), controller, "");
-      if (stat(path, &st) >= 0 || errno != ENOENT)
-	{
-	  msg("Control group %s already exists, trying to empty it.\n", path);
-	  if (rmdir(path) < 0)
-	    die("Failed to reset control group %s: %m", path);
-	}
-
-      if (mkdir(path, 0777) < 0 && !cg_controller_optional(controller))
-	die("Failed to create control group %s: %m", path);
+      msg("Control group %s already exists, trying to empty it.\n", path);
+      if (rmdir(path) < 0)
+	die("Failed to reset control group %s: %m", path);
     }
+  if (mkdir(path, 0777) < 0)
+    die("Failed to create control group %s: %m", path);
 
-  // If the cpuset module is enabled, set up allowed cpus and memory nodes.
+  // If cpuset is available, set up allowed cpus and memory nodes.
   // If per-box configuration exists, use it; otherwise, inherit the settings
   // from the parent cgroup.
-  struct cf_per_box *cf = cf_current_box();
-  if (cg_read(CG_PARENT | CG_CPUSET, "?cpuset.cpus", buf))
-    cg_write(CG_CPUSET, "cpuset.cpus", "%s", cf->cpus ? cf->cpus : buf);
-  if (cg_read(CG_PARENT | CG_CPUSET, "?cpuset.mems", buf))
-    cg_write(CG_CPUSET, "cpuset.mems", "%s", cf->mems ? cf->mems : buf);
+  if (cg_read(CG_PARENT | CG_CPUSET, "?cpuset.cpus.effective", buf))
+    cg_write(CG_CPUSET, "?cpuset.cpus", "%s", cf->cpus ? cf->cpus : buf);
+  if (cg_read(CG_PARENT | CG_CPUSET, "?cpuset.mems.effective", buf))
+    cg_write(CG_CPUSET, "?cpuset.mems", "%s", cf->mems ? cf->mems : buf);
 }
 
 void
@@ -228,24 +197,13 @@ cg_enter(void)
 
   msg("Entering control group %s\n", cg_name);
 
-  FOREACH_CG_CONTROLLER(controller)
-    {
-      if (cg_controller_optional(controller))
-	cg_write(controller, "?tasks", "%d\n", (int) getpid());
-      else
-	cg_write(controller, "tasks", "%d\n", (int) getpid());
-    }
+  cg_write(CG_MEMORY, "cgroup.procs", "%d\n", (int) getpid());
 
   if (cg_memory_limit)
     {
-      cg_write(CG_MEMORY, "memory.limit_in_bytes", "%lld\n", (long long) cg_memory_limit << 10);
-      cg_write(CG_MEMORY, "?memory.memsw.limit_in_bytes", "%lld\n", (long long) cg_memory_limit << 10);
-      cg_write(CG_MEMORY, "memory.max_usage_in_bytes", "0\n");
-      cg_write(CG_MEMORY, "?memory.memsw.max_usage_in_bytes", "0\n");
+      cg_write(CG_MEMORY, "memory.max", "%lld\n", (long long) cg_memory_limit << 10);
+      cg_write(CG_MEMORY, "?memory.swap.max", "%lld\n", (long long) cg_memory_limit << 10);
     }
-
-  if (cg_timing)
-    cg_write(CG_CPUACCT, "cpuacct.usage", "0\n");
 }
 
 int
@@ -255,9 +213,20 @@ cg_get_run_time_ms(void)
     return 0;
 
   char buf[CG_BUFSIZE];
-  cg_read(CG_CPUACCT, "cpuacct.usage", buf);
-  unsigned long long ns = atoll(buf);
-  return ns / 1000000;
+  if (!cg_read(CG_CPUACCT, "cpu.stat", buf))
+    return 0;
+
+  unsigned long long usec = 0;
+  char *s = buf;
+  while (s)
+    {
+      if (sscanf(s, "usage_usec %llu", &usec) == 1)
+        return usec / 1000;
+      s = strchr(s, '\n');
+      if (s)
+	s++;
+    }
+  return 0;
 }
 
 void
@@ -269,20 +238,14 @@ cg_stats(void)
   char buf[CG_BUFSIZE];
 
   // Memory usage statistics
-  unsigned long long mem=0, memsw=0;
-  if (cg_read(CG_MEMORY, "?memory.max_usage_in_bytes", buf))
+  unsigned long long mem = 0;
+  if (cg_read(CG_MEMORY, "?memory.peak", buf))
     mem = atoll(buf);
-  if (cg_read(CG_MEMORY, "?memory.memsw.max_usage_in_bytes", buf))
-    {
-      memsw = atoll(buf);
-      if (memsw > mem)
-	mem = memsw;
-    }
   if (mem)
     meta_printf("cg-mem:%lld\n", mem >> 10);
 
   // OOM kill detection
-  if (cg_read(CG_MEMORY, "?memory.oom_control", buf))
+  if (cg_read(CG_MEMORY, "?memory.events", buf))
     {
       int oom_killed = 0;
       char *s = buf;
@@ -304,24 +267,19 @@ void
 cg_remove(void)
 {
   char buf[CG_BUFSIZE];
+  char path[256];
 
   if (!cg_enable)
     return;
 
-  FOREACH_CG_CONTROLLER(controller)
-    {
-      // The cgroup can be non-existent at this moment (e.g., --cleanup before the first --init)
-      if (!cg_read(controller, "?tasks", buf))
-	continue;
+  // The cgroup can be non-existent at this moment (e.g., --cleanup before the first --init).
+  if (!cg_read(CG_MEMORY, "?cgroup.procs", buf))
+    return;
 
-      if (buf[0])
-	die("Some tasks left in controller %s of cgroup %s, failed to remove it",
-	    cg_controller_name(controller), cg_name);
+  if (buf[0])
+    die("Some tasks left in cgroup %s, failed to remove it", cg_name);
 
-      char path[256];
-      cg_makepath(path, sizeof(path), controller, "");
-
-      if (rmdir(path) < 0)
-	die("Cannot remove control group %s: %m", path);
-    }
+  cg_makepath(path, sizeof(path), CG_MEMORY, "");
+  if (rmdir(path) < 0)
+    die("Cannot remove control group %s: %m", path);
 }
