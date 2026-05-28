@@ -83,6 +83,93 @@ fail:
   return result;
 }
 
+static int
+cg_list_has_item(const char *list, const char *item)
+{
+  size_t n = strlen(item);
+  const char *p = list;
+  while ((p = strstr(p, item)))
+    {
+      char before = (p == list) ? ' ' : p[-1];
+      char after = p[n];
+      int before_ok = (before == ' ' || before == '\n' || before == '\t');
+      int after_ok = (after == 0 || after == ' ' || after == '\n' || after == '\t');
+      if (before_ok && after_ok)
+        return 1;
+      p += n;
+    }
+  return 0;
+}
+
+static int __attribute__((format(printf,3,4)))
+cg_try_write(cg_controller controller, const char *attr, const char *fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+
+  char buf[CG_BUFSIZE];
+  int n = vsnprintf(buf, sizeof(buf), fmt, args);
+  if (n >= CG_BUFSIZE)
+    die("cg_try_write: Value for attribute %s is too long", attr);
+
+  char path[256];
+  cg_makepath(path, sizeof(path), controller, attr);
+
+  int fd = open(path, O_WRONLY | O_TRUNC);
+  if (fd < 0)
+    {
+      va_end(args);
+      return 0;
+    }
+
+  int written = write(fd, buf, n);
+  int saved_errno = errno;
+  close(fd);
+  va_end(args);
+
+  if (written == n)
+    return 1;
+
+  errno = (written < 0) ? saved_errno : EIO;
+  return 0;
+}
+
+static void
+cg_enable_subtree_controller(const char *name, int required)
+{
+  char controllers[CG_BUFSIZE], subtree[CG_BUFSIZE];
+
+  if (!cg_read(CG_PARENT | CG_MEMORY, "cgroup.controllers", controllers))
+    die("Cannot query cgroup.controllers under %s", cg_parent_name);
+
+  if (!cg_list_has_item(controllers, name))
+    {
+      if (required)
+        die("Required cgroup controller '%s' is not available under %s", name, cg_parent_name);
+      return;
+    }
+
+  if (!cg_read(CG_PARENT | CG_MEMORY, "cgroup.subtree_control", subtree))
+    die("Cannot query cgroup.subtree_control under %s", cg_parent_name);
+  if (cg_list_has_item(subtree, name))
+    return;
+
+  if (!cg_try_write(CG_PARENT | CG_MEMORY, "cgroup.subtree_control", "+%s\n", name))
+    {
+      int e = errno;
+      if (cg_read(CG_PARENT | CG_MEMORY, "cgroup.subtree_control", subtree) &&
+          cg_list_has_item(subtree, name))
+        return;
+
+      if (!required && (e == ENOENT || e == EINVAL || e == EBUSY || e == EPERM || e == EROFS))
+        return;
+
+      die("Cannot enable cgroup controller '%s' in parent %s (%s). "
+          "Set cg_parent to a delegated cgroup if needed.",
+          name, cg_parent_name, strerror(e));
+    }
+}
+
 static void __attribute__((format(printf,3,4)))
 cg_write(cg_controller controller, const char *attr, const char *fmt, ...)
 {
@@ -166,9 +253,9 @@ cg_prepare(void)
   char path[256];
   struct cf_per_box *cf = cf_current_box();
 
-  cg_write(CG_PARENT | CG_MEMORY, "cgroup.subtree_control", "+memory\n");
-  cg_write(CG_PARENT | CG_CPUACCT, "cgroup.subtree_control", "+cpu\n");
-  cg_write(CG_PARENT | CG_CPUSET, "?cgroup.subtree_control", "+cpuset\n");
+  cg_enable_subtree_controller("memory", 1);
+  cg_enable_subtree_controller("cpu", 1);
+  cg_enable_subtree_controller("cpuset", 0);
 
   cg_makepath(path, sizeof(path), CG_MEMORY, "");
   if (stat(path, &st) >= 0 || errno != ENOENT)
