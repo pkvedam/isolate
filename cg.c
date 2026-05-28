@@ -84,6 +84,49 @@ fail:
 }
 
 static int
+cg_detect_self_parent(char *buf, size_t len)
+{
+  FILE *f = fopen("/proc/self/cgroup", "r");
+  if (!f)
+    return 0;
+
+  char line[CG_BUFSIZE];
+  int ok = 0;
+  while (fgets(line, sizeof(line), f))
+    {
+      char *p = strstr(line, "0::");
+      if (!p)
+        continue;
+      p += 3;
+
+      char *nl = strchr(p, '\n');
+      if (nl)
+        *nl = 0;
+
+      // Keep relative path form used by cg_makepath().
+      while (*p == '/')
+        p++;
+
+      if (!*p)
+        {
+          // Process is in root cgroup.
+          strncpy(buf, ".", len);
+          buf[len - 1] = 0;
+        }
+      else
+        {
+          strncpy(buf, p, len);
+          buf[len - 1] = 0;
+        }
+      ok = 1;
+      break;
+    }
+
+  fclose(f);
+  return ok;
+}
+
+static int
 cg_list_has_item(const char *list, const char *item)
 {
   size_t n = strlen(item);
@@ -236,8 +279,13 @@ cg_init(void)
     }
   else
     {
-      snprintf(cg_name, sizeof(cg_name), "box-%d", box_id);
-      strcpy(cg_parent_name, ".");
+      if (!cg_detect_self_parent(cg_parent_name, sizeof(cg_parent_name)))
+        strcpy(cg_parent_name, ".");
+
+      if (!strcmp(cg_parent_name, "."))
+        snprintf(cg_name, sizeof(cg_name), "box-%d", box_id);
+      else
+        snprintf(cg_name, sizeof(cg_name), "%s/box-%d", cg_parent_name, box_id);
     }
   msg("Using control group %s under parent %s\n", cg_name, cg_parent_name);
 }
